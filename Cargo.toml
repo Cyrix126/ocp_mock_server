@@ -1,0 +1,16 @@
+[package]
+name = "ocp-mock-server"
+version = "0.1.0"
+edition = "2024"
+description = "Mock OpenCryptoPay provider for end-to-end wallet testing"
+license = "AGPL-v3"
+
+[dependencies]
+actix-web = "4"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+qrcode = { version = "0.14", default-features = false }
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+actix-http = "3"
