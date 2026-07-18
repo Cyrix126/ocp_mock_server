@@ -2,7 +2,7 @@
 //!
 //! Implements the provider side of the OpenCryptoPay standard as documented
 //! at https://github.com/openCryptoPay/landingPage, so a wallet can be tested
-//! end-to-end against an address you own. See README.md and `--help`.
+//! end-to-end against addresses you own. See README.md and `--help`.
 
 mod cli;
 mod handlers;
@@ -21,15 +21,13 @@ use crate::state::AppState;
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let cfg = Config::parse();
-    let uri = match payment_uri::build_uri(&cfg) {
-        Ok(uri) => uri,
+    let state = match AppState::new(cfg) {
+        Ok(state) => web::Data::new(state),
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(2);
         }
     };
-
-    let state = web::Data::new(AppState::new(cfg, uri));
     print_banner(&state);
 
     let port = state.cfg.port;
@@ -58,10 +56,21 @@ fn print_banner(state: &AppState) {
 
     println!("Mock OpenCryptoPay provider (spec: github.com/openCryptoPay/landingPage)");
     println!();
-    println!("  Method / asset : {} / {}", cfg.method, cfg.asset);
-    println!("  Pay to         : {}", cfg.address);
-    println!("  Amount         : {} {}", cfg.amount, cfg.asset);
-    println!("  Payment URI    : {}", state.uri);
+    println!("Accepted coins:");
+    for coin in &state.coins {
+        let spec = &coin.spec;
+        let proof = if spec.method.is_hex() {
+            "signed HEX, wallet must NOT broadcast"
+        } else {
+            "tx hash, wallet broadcasts"
+        };
+        println!(
+            "  - {} / {} : {} -> {} ({proof})",
+            spec.method, spec.asset, spec.amount, spec.address
+        );
+        println!("    URI: {}", coin.uri);
+    }
+    println!();
     println!("  API URL        : {api_url}");
     println!("  Proof endpoint : {}", cfg.proof_url(&payment_id));
     println!();
@@ -80,13 +89,19 @@ fn print_banner(state: &AppState) {
     println!();
     println!("{qr_link}");
     println!();
-    if cfg.method.is_hex() {
+    if state.coins.iter().any(|c| c.spec.method.is_hex()) {
+        let hex_methods: Vec<&str> = state
+            .coins
+            .iter()
+            .filter(|c| c.spec.method.is_hex())
+            .map(|c| c.spec.method.spec_name())
+            .collect();
         println!(
             "NOTE: for {} the wallet submits the SIGNED TX HEX and does not\n\
              broadcast — the mock only logs it. Broadcast it yourself (e.g.\n\
              `bitcoin-cli sendrawtransaction <hex>` or an eth_sendRawTransaction\n\
              push service) if you want the funds to actually move.",
-            cfg.method
+            hex_methods.join(", ")
         );
         println!();
     }

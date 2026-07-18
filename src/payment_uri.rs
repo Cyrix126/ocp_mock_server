@@ -1,39 +1,39 @@
 //! Blockchain payment URI construction for the transaction details response.
 
-use crate::cli::Config;
+use crate::cli::CoinSpec;
 
 /// Build the payment URI handed out in the transaction details:
 /// EIP-681 for EVM (native `?value=` or token `/transfer?...&uint256=`),
 /// `tx_amount` for Monero, BIP-21-style `?amount=` for everything else.
-pub fn build_uri(cfg: &Config) -> Result<String, String> {
-    if let Some(uri) = &cfg.uri_override {
+pub fn build_uri(spec: &CoinSpec) -> Result<String, String> {
+    if let Some(uri) = &spec.uri_override {
         return Ok(uri.clone());
     }
-    if cfg.method.is_evm() {
-        let chain_id = cfg
+    if spec.method.is_evm() {
+        let chain_id = spec
             .chain_id
-            .or_else(|| cfg.method.default_chain_id())
-            .ok_or("no default chain id for this method, pass --chain-id")?;
-        return if let Some(contract) = &cfg.token_contract {
-            let decimals = cfg
+            .or_else(|| spec.method.default_chain_id())
+            .ok_or("no default chain id for this method, pass chain-id=")?;
+        return if let Some(contract) = &spec.token_contract {
+            let decimals = spec
                 .token_decimals
-                .ok_or("--token-decimals is required with --token-contract")?;
-            let raw = scale_decimal(&cfg.amount, decimals)?;
+                .ok_or("contract= requires decimals=")?;
+            let raw = scale_decimal(&spec.amount, decimals)?;
             Ok(format!(
                 "ethereum:{contract}@{chain_id}/transfer?address={}&uint256={raw}",
-                cfg.address
+                spec.address
             ))
         } else {
-            let raw = scale_decimal(&cfg.amount, 18)?;
-            Ok(format!("ethereum:{}@{chain_id}?value={raw}", cfg.address))
+            let raw = scale_decimal(&spec.amount, 18)?;
+            Ok(format!("ethereum:{}@{chain_id}?value={raw}", spec.address))
         };
     }
-    if cfg.token_contract.is_some() {
-        return Err("--token-contract is only supported for EVM methods".into());
+    if spec.token_contract.is_some() {
+        return Err("contract= is only supported for EVM methods".into());
     }
-    Ok(match cfg.method.spec_name() {
-        "Monero" => format!("monero:{}?tx_amount={}", cfg.address, cfg.amount),
-        m => format!("{}:{}?amount={}", m.to_lowercase(), cfg.address, cfg.amount),
+    Ok(match spec.method.spec_name() {
+        "Monero" => format!("monero:{}?tx_amount={}", spec.address, spec.amount),
+        m => format!("{}:{}?amount={}", m.to_lowercase(), spec.address, spec.amount),
     })
 }
 
@@ -79,30 +79,30 @@ mod tests {
 
     #[test]
     fn evm_native_uses_wei_value() {
-        let cfg = Config::for_tests(
+        let spec = CoinSpec::for_tests(
             Method::Ethereum,
             "ETH",
             "0x1111111111111111111111111111111111111111",
             "0.0004",
         );
         assert_eq!(
-            build_uri(&cfg).unwrap(),
+            build_uri(&spec).unwrap(),
             "ethereum:0x1111111111111111111111111111111111111111@1?value=400000000000000"
         );
     }
 
     #[test]
     fn erc20_uses_eip681_transfer_form() {
-        let mut cfg = Config::for_tests(
+        let mut spec = CoinSpec::for_tests(
             Method::Ethereum,
             "USDC",
             "0x1111111111111111111111111111111111111111",
             "1.25",
         );
-        cfg.token_contract = Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into());
-        cfg.token_decimals = Some(6);
+        spec.token_contract = Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into());
+        spec.token_decimals = Some(6);
         assert_eq!(
-            build_uri(&cfg).unwrap(),
+            build_uri(&spec).unwrap(),
             "ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48@1/transfer\
              ?address=0x1111111111111111111111111111111111111111&uint256=1250000"
         );
@@ -110,29 +110,29 @@ mod tests {
 
     #[test]
     fn monero_uses_tx_amount() {
-        let cfg = Config::for_tests(Method::Monero, "XMR", "4AdUmoney", "0.005");
-        assert_eq!(build_uri(&cfg).unwrap(), "monero:4AdUmoney?tx_amount=0.005");
+        let spec = CoinSpec::for_tests(Method::Monero, "XMR", "4AdUmoney", "0.005");
+        assert_eq!(build_uri(&spec).unwrap(), "monero:4AdUmoney?tx_amount=0.005");
     }
 
     #[test]
     fn namecoin_uses_bip21_style_uri() {
-        let cfg = Config::for_tests(
+        let spec = CoinSpec::for_tests(
             Method::Namecoin,
             "NMC",
             "N2pGWAh65TWpWmEFrFssRQkQubbczJSKi9",
             "0.5",
         );
         assert_eq!(
-            build_uri(&cfg).unwrap(),
+            build_uri(&spec).unwrap(),
             "namecoin:N2pGWAh65TWpWmEFrFssRQkQubbczJSKi9?amount=0.5"
         );
     }
 
     #[test]
     fn token_contract_rejected_outside_evm() {
-        let mut cfg = Config::for_tests(Method::Bitcoin, "BTC", "bc1qtest", "0.0001");
-        cfg.token_contract = Some("0xdead".into());
-        cfg.token_decimals = Some(6);
-        assert!(build_uri(&cfg).is_err());
+        let mut spec = CoinSpec::for_tests(Method::Bitcoin, "BTC", "bc1qtest", "0.0001");
+        spec.token_contract = Some("0xdead".into());
+        spec.token_decimals = Some(6);
+        assert!(build_uri(&spec).is_err());
     }
 }

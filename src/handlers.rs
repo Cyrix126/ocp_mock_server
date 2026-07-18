@@ -51,7 +51,10 @@ async fn payment_details(
     }
     state.refresh_quote();
     let quote = state.quote.lock().unwrap();
-    respond(200, payloads::payment_details(&state.cfg, &quote))
+    respond(
+        200,
+        payloads::payment_details(&state.cfg, &quote, &state.coins),
+    )
 }
 
 /// Transaction details via the callback URL (step 3).
@@ -98,23 +101,23 @@ fn transaction_details_response(
 
     let method = query.get("method").map(String::as_str).unwrap_or("");
     let asset = query.get("asset").map(String::as_str).unwrap_or("");
-    if method != state.cfg.method.spec_name() || asset != state.cfg.asset {
+    let Some(coin) = state.find_coin(method, asset) else {
         return respond(
             400,
             payloads::error(
                 400,
                 &format!(
-                    "Method/asset not available (expected {}/{}, got {method}/{asset})",
-                    state.cfg.method, state.cfg.asset
+                    "Method/asset {method}/{asset} not available (supported: {})",
+                    state.supported_pairs()
                 ),
                 "Bad Request",
             ),
         );
-    }
+    };
 
     respond(
         200,
-        payloads::transaction_details(&state.cfg, &quote, &state.uri),
+        payloads::transaction_details(&state.cfg, &quote, coin),
     )
 }
 
@@ -150,29 +153,29 @@ async fn transaction_proof(
         return response;
     }
 
-    let method = query.get("method").map(String::as_str).unwrap_or("");
-    if method != state.cfg.method.spec_name() {
+    let method_param = query.get("method").map(String::as_str).unwrap_or("");
+    let Some(method) = state.find_method(method_param) else {
         return respond(
             400,
             payloads::error(
                 400,
-                &format!("Wrong method (expected '{}', got '{method}')", state.cfg.method),
+                &format!(
+                    "Wrong method '{method_param}' (supported: {})",
+                    state.supported_pairs()
+                ),
                 "Bad Request",
             ),
         );
-    }
+    };
 
-    let expected = state.cfg.method.proof_param();
+    let expected = method.proof_param();
     let other = if expected == "hex" { "tx" } else { "hex" };
     if query.contains_key(other) {
         return respond(
             400,
             payloads::error(
                 400,
-                &format!(
-                    "Method {} expects the '{expected}' parameter, got '{other}'",
-                    state.cfg.method
-                ),
+                &format!("Method {method} expects the '{expected}' parameter, got '{other}'"),
                 "Bad Request",
             ),
         );
@@ -182,14 +185,14 @@ async fn transaction_proof(
             400,
             payloads::error(
                 400,
-                &format!("Missing '{expected}' parameter for method {}", state.cfg.method),
+                &format!("Missing '{expected}' parameter for method {method}"),
                 "Bad Request",
             ),
         );
     };
 
     println!();
-    println!("=== PAYMENT PROOF RECEIVED ({}) ===", state.cfg.method);
+    println!("=== PAYMENT PROOF RECEIVED ({method}) ===");
     if expected == "hex" {
         println!("Signed transaction HEX (NOT broadcast by this mock):");
         println!("{proof}");
@@ -261,25 +264,31 @@ mod tests {
     use actix_web::{middleware, test, App};
 
     use super::*;
-    use crate::cli::Config;
+    use crate::cli::{CoinSpec, Config};
     use crate::method::Method;
-    use crate::payment_uri::build_uri;
 
-    fn xmr_state() -> web::Data<AppState> {
-        let cfg = Config::for_tests(Method::Monero, "XMR", "4AdUmoney", "0.005");
-        let uri = build_uri(&cfg).unwrap();
-        web::Data::new(AppState::new(cfg, uri))
+    fn multi_coin_state() -> web::Data<AppState> {
+        let cfg = Config::for_tests(vec![
+            CoinSpec::for_tests(Method::Monero, "XMR", "4AdUmoney", "0.005"),
+            CoinSpec::for_tests(
+                Method::Namecoin,
+                "NMC",
+                "N2pGWAh65TWpWmEFrFssRQkQubbczJSKi9",
+                "0.5",
+            ),
+            CoinSpec::for_tests(Method::Ethereum, "ETH", "0x11", "0.0004"),
+            {
+                let mut usdc = CoinSpec::for_tests(Method::Ethereum, "USDC", "0x11", "1.25");
+                usdc.token_contract = Some("0xA0b8".into());
+                usdc.token_decimals = Some(6);
+                usdc
+            },
+        ]);
+        web::Data::new(AppState::new(cfg).unwrap())
     }
 
-    fn nmc_state() -> web::Data<AppState> {
-        let cfg = Config::for_tests(
-            Method::Namecoin,
-            "NMC",
-            "N2pGWAh65TWpWmEFrFssRQkQubbczJSKi9",
-            "0.5",
-        );
-        let uri = build_uri(&cfg).unwrap();
-        web::Data::new(AppState::new(cfg, uri))
+    fn quote_id(state: &AppState) -> String {
+        state.quote.lock().unwrap().quote_id.clone()
     }
 
     macro_rules! app {
@@ -306,47 +315,97 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn payment_details_carries_quote_and_transfer_amounts() {
-        let state = xmr_state();
+    async fn payment_details_lists_all_methods_grouped_by_method() {
+        let state = multi_coin_state();
         let app = app!(state.clone());
 
         let (status, body) = get(&app, "/v1/lnurlp/pl_mock01").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["displayName"], "OCP Mock Shop");
-        assert_eq!(body["callback"], "http://127.0.0.1:8080/v1/lnurlp/cb/pl_mock01");
-        assert_eq!(body["quote"]["id"], state.quote.lock().unwrap().quote_id);
-        assert_eq!(body["transferAmounts"][0]["method"], "Monero");
-        assert_eq!(body["transferAmounts"][0]["assets"][0]["asset"], "XMR");
-        assert_eq!(body["transferAmounts"][0]["assets"][0]["amount"], "0.005");
+        assert_eq!(body["quote"]["id"], quote_id(&state));
+
+        let transfers = body["transferAmounts"].as_array().unwrap();
+        // Ethereum ETH + USDC collapse into one method entry.
+        assert_eq!(transfers.len(), 3);
+        assert_eq!(transfers[0]["method"], "Monero");
+        assert_eq!(transfers[1]["method"], "Namecoin");
+        assert_eq!(transfers[2]["method"], "Ethereum");
+        let eth_assets = transfers[2]["assets"].as_array().unwrap();
+        assert_eq!(eth_assets.len(), 2);
+        assert_eq!(eth_assets[0]["asset"], "ETH");
+        assert_eq!(eth_assets[1]["asset"], "USDC");
+        assert_eq!(eth_assets[1]["amount"], "1.25");
     }
 
     #[actix_web::test]
-    async fn simplified_flow_returns_transaction_details() {
-        let state = xmr_state();
-        let quote_id = state.quote.lock().unwrap().quote_id.clone();
+    async fn each_coin_gets_its_own_transaction_details() {
+        let state = multi_coin_state();
+        let quote = quote_id(&state);
         let app = app!(state);
 
         let (status, body) = get(
             &app,
-            &format!("/v1/lnurlp/pl_mock01?quote={quote_id}&method=Monero&asset=XMR"),
+            &format!("/v1/lnurlp/cb/pl_mock01?quote={quote}&method=Monero&asset=XMR"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["uri"], "monero:4AdUmoney?tx_amount=0.005");
+        assert!(!body["hint"].as_str().unwrap().contains("as HEX"));
+
+        let (status, body) = get(
+            &app,
+            &format!("/v1/lnurlp/cb/pl_mock01?quote={quote}&method=Ethereum&asset=USDC"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["uri"],
+            "ethereum:0xA0b8@1/transfer?address=0x11&uint256=1250000"
+        );
+        assert!(body["hint"].as_str().unwrap().contains("as HEX"));
+    }
+
+    #[actix_web::test]
+    async fn unknown_pair_lists_supported_coins() {
+        let state = multi_coin_state();
+        let quote = quote_id(&state);
+        let app = app!(state);
+
+        let (status, body) = get(
+            &app,
+            &format!("/v1/lnurlp/cb/pl_mock01?quote={quote}&method=Bitcoin&asset=BTC"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("Bitcoin/BTC not available"));
+        assert!(message.contains("Monero/XMR, Namecoin/NMC, Ethereum/ETH, Ethereum/USDC"));
+    }
+
+    #[actix_web::test]
+    async fn simplified_flow_returns_transaction_details() {
+        let state = multi_coin_state();
+        let quote = quote_id(&state);
+        let app = app!(state);
+
+        let (status, body) = get(
+            &app,
+            &format!("/v1/lnurlp/pl_mock01?quote={quote}&method=Monero&asset=XMR"),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["blockchain"], "Monero");
         assert_eq!(body["uri"], "monero:4AdUmoney?tx_amount=0.005");
-        // Hash-family hint: wallet broadcasts, no "as HEX" wording.
-        assert!(!body["hint"].as_str().unwrap().contains("as HEX"));
     }
 
     #[actix_web::test]
     async fn callback_rejects_proof_parameters() {
-        let state = xmr_state();
-        let quote_id = state.quote.lock().unwrap().quote_id.clone();
+        let state = multi_coin_state();
+        let quote = quote_id(&state);
         let app = app!(state);
 
         let (status, body) = get(
             &app,
-            &format!("/v1/lnurlp/cb/pl_mock01?quote={quote_id}&method=Monero&tx=abc"),
+            &format!("/v1/lnurlp/cb/pl_mock01?quote={quote}&method=Monero&tx=abc"),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -354,63 +413,93 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn proof_accepted_on_both_tx_path_ids() {
-        let state = xmr_state();
-        let quote_id = state.quote.lock().unwrap().quote_id.clone();
-        let payment_id = state.quote.lock().unwrap().payment_id.clone();
+    async fn proof_param_follows_the_submitted_method() {
+        let state = multi_coin_state();
+        let quote = quote_id(&state);
         let app = app!(state);
 
+        // Monero (hash family): `tx` accepted.
         let (status, _) = get(
             &app,
-            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote_id}&method=Monero&tx=hash1"),
+            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote}&method=Monero&tx=hash1"),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
 
+        // Namecoin (hex family): `tx` rejected, `hex` accepted.
         let (status, body) = get(
             &app,
-            &format!("/v1/lnurlp/tx/{payment_id}?quote={quote_id}&method=Monero&tx=hash2"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "Complete");
-    }
-
-    #[actix_web::test]
-    async fn proof_validates_quote_and_param_name() {
-        let state = nmc_state();
-        let quote_id = state.quote.lock().unwrap().quote_id.clone();
-        let app = app!(state);
-
-        let (status, body) = get(
-            &app,
-            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote_id}&method=Namecoin&tx=abc"),
+            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote}&method=Namecoin&tx=abc"),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["message"].as_str().unwrap().contains("'hex'"));
 
-        let (status, _) = get(
+        let (status, body) = get(
             &app,
-            "/v1/lnurlp/tx/pl_mock01?quote=plq_bogus&method=Namecoin&hex=beef",
+            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote}&method=Namecoin&hex=beef"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "Complete");
+
+        // A method that is not configured at all.
+        let (status, body) = get(
+            &app,
+            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote}&method=Bitcoin&hex=beef"),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("Wrong method"));
+    }
 
+    #[actix_web::test]
+    async fn proof_accepted_on_both_tx_path_ids() {
+        let state = multi_coin_state();
+        let quote = quote_id(&state);
+        let payment_id = state.quote.lock().unwrap().payment_id.clone();
+        let app = app!(state);
+
+        // Spec construction rule: callback URL with /cb replaced by /tx (pl_ id).
         let (status, _) = get(
             &app,
-            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote_id}&method=Namecoin&hex=beef"),
+            &format!("/v1/lnurlp/tx/pl_mock01?quote={quote}&method=Monero&tx=hash1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Hint form: the payment id (plp_...).
+        let (status, _) = get(
+            &app,
+            &format!("/v1/lnurlp/tx/{payment_id}?quote={quote}&method=Monero&tx=hash2"),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
     }
 
     #[actix_web::test]
+    async fn proof_rejects_unknown_quote() {
+        let state = multi_coin_state();
+        let app = app!(state);
+
+        let (status, _) = get(
+            &app,
+            "/v1/lnurlp/tx/pl_mock01?quote=plq_bogus&method=Monero&tx=abc",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
     async fn no_pending_serves_spec_404_shape() {
-        let mut cfg = Config::for_tests(Method::Monero, "XMR", "4AdUmoney", "0.005");
+        let mut cfg = Config::for_tests(vec![CoinSpec::for_tests(
+            Method::Monero,
+            "XMR",
+            "4AdUmoney",
+            "0.005",
+        )]);
         cfg.no_pending = true;
-        let uri = build_uri(&cfg).unwrap();
-        let app = app!(web::Data::new(AppState::new(cfg, uri)));
+        let app = app!(web::Data::new(AppState::new(cfg).unwrap()));
 
         let (status, body) = get(&app, "/v1/lnurlp/pl_mock01").await;
         assert_eq!(status, StatusCode::NOT_FOUND);

@@ -4,12 +4,30 @@
 use serde_json::{json, Value};
 
 use crate::cli::Config;
-use crate::state::{number, rfc3339, Quote};
+use crate::state::{number, rfc3339, CoinEntry, Quote};
 
-/// Payment details (step 2 of the spec flow).
-pub fn payment_details(cfg: &Config, quote: &Quote) -> Value {
+/// Payment details (step 2 of the spec flow). Coins are grouped into one
+/// `transferAmounts` entry per method, listing every asset offered on it.
+pub fn payment_details(cfg: &Config, quote: &Quote, coins: &[CoinEntry]) -> Value {
     let description = format!("{} - {} {}", cfg.name, cfg.fiat, cfg.fiat_amount);
     let metadata = serde_json::to_string(&json!([["text/plain", description]])).unwrap();
+
+    let mut transfer_amounts: Vec<Value> = Vec::new();
+    for entry in coins {
+        let method = entry.spec.method.spec_name();
+        let asset = json!({ "asset": entry.spec.asset, "amount": entry.spec.amount });
+        if let Some(existing) = transfer_amounts.iter_mut().find(|v| v["method"] == method) {
+            existing["assets"].as_array_mut().unwrap().push(asset);
+        } else {
+            transfer_amounts.push(json!({
+                "method": method,
+                "minFee": number(entry.spec.min_fee),
+                "assets": [asset],
+                "available": true
+            }));
+        }
+    }
+
     json!({
         "id": cfg.id,
         "externalId": "ocp-mock",
@@ -48,22 +66,15 @@ pub fn payment_details(cfg: &Config, quote: &Quote) -> Value {
             "asset": cfg.fiat,
             "amount": number(cfg.fiat_amount),
         },
-        "transferAmounts": [
-            {
-                "method": cfg.method.spec_name(),
-                "minFee": number(cfg.min_fee),
-                "assets": [ { "asset": cfg.asset, "amount": cfg.amount } ],
-                "available": true
-            }
-        ]
+        "transferAmounts": transfer_amounts
     })
 }
 
-/// Transaction details (step 3 / simplified flow), with the spec's hint
-/// wording per proof family.
-pub fn transaction_details(cfg: &Config, quote: &Quote, uri: &str) -> Value {
+/// Transaction details (step 3 / simplified flow) for the selected coin,
+/// with the spec's hint wording per proof family.
+pub fn transaction_details(cfg: &Config, quote: &Quote, coin: &CoinEntry) -> Value {
     let tx_url = cfg.proof_url(&quote.payment_id);
-    let hint = if cfg.method.is_hex() {
+    let hint = if coin.spec.method.is_hex() {
         format!(
             "Use this data to create a transaction and sign it. Send the signed \
              transaction back as HEX via the endpoint {tx_url}. We check the \
@@ -78,8 +89,8 @@ pub fn transaction_details(cfg: &Config, quote: &Quote, uri: &str) -> Value {
     };
     json!({
         "expiryDate": rfc3339(quote.expiration),
-        "blockchain": cfg.method.spec_name(),
-        "uri": uri,
+        "blockchain": coin.spec.method.spec_name(),
+        "uri": coin.uri,
         "hint": hint,
     })
 }
